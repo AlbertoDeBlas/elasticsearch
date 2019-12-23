@@ -64,7 +64,6 @@ import org.elasticsearch.index.mapper.ParsedDocument;
 import org.elasticsearch.index.mapper.SeqNoFieldMapper;
 import org.elasticsearch.index.mapper.Uid;
 import org.elasticsearch.index.seqno.ReplicationTracker;
-import org.elasticsearch.index.seqno.RetentionLease;
 import org.elasticsearch.index.seqno.RetentionLeases;
 import org.elasticsearch.index.seqno.SeqNoStats;
 import org.elasticsearch.index.seqno.SequenceNumbers;
@@ -102,7 +101,6 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 import java.util.function.IntSupplier;
 import java.util.zip.CRC32;
 
@@ -294,7 +292,6 @@ public class RecoverySourceHandlerTests extends ESTestCase {
     }
 
     private Engine.Index getIndex(final String id) {
-        final String type = "test";
         final ParseContext.Document document = new ParseContext.Document();
         document.add(new TextField("test", "test", Field.Store.YES));
         final Field idField = new Field("_id", Uid.encodeId(id), IdFieldMapper.Defaults.FIELD_TYPE);
@@ -307,7 +304,7 @@ public class RecoverySourceHandlerTests extends ESTestCase {
         document.add(seqID.primaryTerm);
         final BytesReference source = new BytesArray(new byte[] { 1 });
         final ParsedDocument doc =
-            new ParsedDocument(versionField, seqID, id, type, null, Arrays.asList(document), source, XContentType.JSON, null);
+            new ParsedDocument(versionField, seqID, id, null, Arrays.asList(document), source, XContentType.JSON, null);
         return new Engine.Index(new Term("_id", Uid.encodeId(doc.id())), randomNonNegativeLong(), doc);
     }
 
@@ -468,10 +465,9 @@ public class RecoverySourceHandlerTests extends ESTestCase {
                 between(1, 8)) {
 
             @Override
-            void phase1(IndexCommit snapshot, Consumer<ActionListener<RetentionLease>> createRetentionLease,
-                        IntSupplier translogOps, ActionListener<SendFileResult> listener) {
+            void phase1(IndexCommit snapshot, long startingSeqNo, IntSupplier translogOps, ActionListener<SendFileResult> listener) {
                 phase1Called.set(true);
-                super.phase1(snapshot, createRetentionLease, translogOps, listener);
+                super.phase1(snapshot, startingSeqNo, translogOps, listener);
             }
 
             @Override
@@ -632,6 +628,7 @@ public class RecoverySourceHandlerTests extends ESTestCase {
         store.close();
     }
 
+    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/50424")
     public void testCancelRecoveryDuringPhase1() throws Exception {
         Store store = newStore(createTempDir("source"), false);
         IndexShard shard = mock(IndexShard.class);
@@ -687,7 +684,7 @@ public class RecoverySourceHandlerTests extends ESTestCase {
         try {
             final CountDownLatch latch = new CountDownLatch(1);
             handler.phase1(DirectoryReader.listCommits(dir).get(0),
-                l -> recoveryExecutor.execute(() -> l.onResponse(null)),
+                0,
                 () -> 0,
                 new LatchedActionListener<>(phase1Listener, latch));
             latch.await();

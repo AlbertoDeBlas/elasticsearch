@@ -29,6 +29,7 @@ import org.elasticsearch.xpack.core.ml.job.persistence.AnomalyDetectorsIndex;
 import org.elasticsearch.xpack.core.ml.job.process.autodetect.state.ModelSnapshot;
 import org.elasticsearch.xpack.core.ml.job.results.Bucket;
 import org.elasticsearch.xpack.core.ml.job.results.ForecastRequestStats;
+import org.elasticsearch.xpack.core.ml.notifications.AuditorField;
 import org.junit.After;
 import org.junit.Before;
 
@@ -86,7 +87,7 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         cleanUp();
     }
 
-    public void testDeleteExpiredDataGivenNothingToDelete() throws Exception {
+    public void testDeleteExpiredData_GivenNothingToDelete() throws Exception {
         // Tests that nothing goes wrong when there's nothing to delete
         client().execute(DeleteExpiredDataAction.INSTANCE, new DeleteExpiredDataAction.Request()).get();
     }
@@ -166,7 +167,8 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         client().admin().indices().prepareRefresh("*").get();
 
         // We need to wait a second to ensure the second time around model snapshots will have a different ID (it depends on epoch seconds)
-        awaitBusy(() -> false, 1, TimeUnit.SECONDS);
+        // FIXME it would be better to wait for something concrete instead of wait for time to elapse
+        assertBusy(() -> {}, 1, TimeUnit.SECONDS);
 
         for (Job.Builder job : getJobs()) {
             // Run up to now
@@ -183,7 +185,8 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         long totalModelSizeStatsBeforeDelete = client().prepareSearch("*")
                 .setQuery(QueryBuilders.termQuery("result_type", "model_size_stats"))
                 .get().getHits().getTotalHits().value;
-        long totalNotificationsCountBeforeDelete = client().prepareSearch(".ml-notifications").get().getHits().getTotalHits().value;
+        long totalNotificationsCountBeforeDelete =
+            client().prepareSearch(AuditorField.NOTIFICATIONS_INDEX).get().getHits().getTotalHits().value;
         assertThat(totalModelSizeStatsBeforeDelete, greaterThan(0L));
         assertThat(totalNotificationsCountBeforeDelete, greaterThan(0L));
 
@@ -198,10 +201,7 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         assertThat(indexUnusedStateDocsResponse.get().status(), equalTo(RestStatus.OK));
 
         // Now call the action under test
-        client().execute(DeleteExpiredDataAction.INSTANCE, new DeleteExpiredDataAction.Request()).get();
-
-        // We need to refresh to ensure the deletion is visible
-        client().admin().indices().prepareRefresh("*").get();
+        assertThat(deleteExpiredData().isDeleted(), is(true));
 
         // no-retention job should have kept all data
         assertThat(getBuckets("no-retention").size(), is(greaterThanOrEqualTo(70)));
@@ -233,7 +233,8 @@ public class DeleteExpiredDataIT extends MlNativeAutodetectIntegTestCase {
         long totalModelSizeStatsAfterDelete = client().prepareSearch("*")
                 .setQuery(QueryBuilders.termQuery("result_type", "model_size_stats"))
                 .get().getHits().getTotalHits().value;
-        long totalNotificationsCountAfterDelete = client().prepareSearch(".ml-notifications").get().getHits().getTotalHits().value;
+        long totalNotificationsCountAfterDelete =
+            client().prepareSearch(AuditorField.NOTIFICATIONS_INDEX).get().getHits().getTotalHits().value;
         assertThat(totalModelSizeStatsAfterDelete, equalTo(totalModelSizeStatsBeforeDelete));
         assertThat(totalNotificationsCountAfterDelete, greaterThanOrEqualTo(totalNotificationsCountBeforeDelete));
 

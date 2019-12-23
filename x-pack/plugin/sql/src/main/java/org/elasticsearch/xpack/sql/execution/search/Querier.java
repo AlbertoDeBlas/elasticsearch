@@ -36,9 +36,9 @@ import org.elasticsearch.xpack.sql.execution.search.extractor.ConstantExtractor;
 import org.elasticsearch.xpack.sql.execution.search.extractor.FieldHitExtractor;
 import org.elasticsearch.xpack.sql.execution.search.extractor.HitExtractor;
 import org.elasticsearch.xpack.sql.execution.search.extractor.MetricAggExtractor;
+import org.elasticsearch.xpack.sql.execution.search.extractor.PivotExtractor;
 import org.elasticsearch.xpack.sql.execution.search.extractor.TopHitsAggExtractor;
 import org.elasticsearch.xpack.sql.expression.Attribute;
-import org.elasticsearch.xpack.sql.expression.ExpressionId;
 import org.elasticsearch.xpack.sql.expression.gen.pipeline.AggExtractorInput;
 import org.elasticsearch.xpack.sql.expression.gen.pipeline.AggPathInput;
 import org.elasticsearch.xpack.sql.expression.gen.pipeline.HitExtractorInput;
@@ -50,6 +50,7 @@ import org.elasticsearch.xpack.sql.querydsl.container.ComputedRef;
 import org.elasticsearch.xpack.sql.querydsl.container.GlobalCountRef;
 import org.elasticsearch.xpack.sql.querydsl.container.GroupByRef;
 import org.elasticsearch.xpack.sql.querydsl.container.MetricAggRef;
+import org.elasticsearch.xpack.sql.querydsl.container.PivotColumnRef;
 import org.elasticsearch.xpack.sql.querydsl.container.QueryContainer;
 import org.elasticsearch.xpack.sql.querydsl.container.ScriptFieldRef;
 import org.elasticsearch.xpack.sql.querydsl.container.SearchHitFieldRef;
@@ -71,9 +72,12 @@ import java.util.BitSet;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiFunction;
+import java.util.function.Supplier;
 
 import static java.util.Collections.singletonList;
 import static org.elasticsearch.action.ActionListener.wrap;
@@ -321,21 +325,39 @@ public class Querier {
      */
     static class CompositeActionListener extends BaseAggActionListener {
 
+        private final boolean isPivot;
+
         CompositeActionListener(ActionListener<Page> listener, Client client, Configuration cfg,
                 List<Attribute> output, QueryContainer query, SearchRequest request) {
             super(listener, client, cfg, output, query, request);
+
+            isPivot = query.fields().stream().anyMatch(t -> t.v1() instanceof PivotColumnRef);
         }
 
         @Override
         protected void handleResponse(SearchResponse response, ActionListener<Page> listener) {
             
-            CompositeAggregationCursor.handle(response, request.source(),
-                    ba -> new SchemaCompositeAggsRowSet(schema, initBucketExtractors(response), mask, response,
-                            query.sortingColumns().isEmpty() ? query.limit() : -1, ba),
+            Supplier<CompositeAggRowSet> makeRowSet = isPivot ?
+                    () -> new PivotRowSet(schema, initBucketExtractors(response), mask, response,
+                            query.sortingColumns().isEmpty() ? query.limit() : -1, null) :
+                    () -> new SchemaCompositeAggRowSet(schema, initBucketExtractors(response), mask, response,
+                            query.sortingColumns().isEmpty() ? query.limit() : -1);
+                    
+            BiFunction<byte[], CompositeAggRowSet, CompositeAggCursor> makeCursor = isPivot ?
+                    (q, r) -> {
+                        Map<String, Object> lastAfterKey = r instanceof PivotRowSet ? ((PivotRowSet) r).lastAfterKey() : null;
+                        return new PivotCursor(lastAfterKey, q, r.extractors(), r.mask(), r.remainingData(), query.shouldIncludeFrozen(),
+                                request.indices());
+                    } :
+                    (q, r) -> new CompositeAggCursor(q, r.extractors(), r.mask(), r.remainingData, query.shouldIncludeFrozen(),
+                            request.indices());
+                    
+            CompositeAggCursor.handle(response, request.source(),
+                    makeRowSet,
+                    makeCursor,
                     () -> client.search(request, this),
-                    p -> listener.onResponse(p),
-                    e -> listener.onFailure(e),
-                    schema, query.shouldIncludeFrozen(), request.indices());
+                    listener,
+                    schema);
         }
     }
 
@@ -355,11 +377,11 @@ public class Querier {
 
         protected List<BucketExtractor> initBucketExtractors(SearchResponse response) {
             // create response extractors for the first time
-            List<Tuple<FieldExtraction, ExpressionId>> refs = query.fields();
+            List<Tuple<FieldExtraction, String>> refs = query.fields();
 
             List<BucketExtractor> exts = new ArrayList<>(refs.size());
             ConstantExtractor totalCount = new ConstantExtractor(response.getHits().getTotalHits().value);
-            for (Tuple<FieldExtraction, ExpressionId> ref : refs) {
+            for (Tuple<FieldExtraction, String> ref : refs) {
                 exts.add(createExtractor(ref.v1(), totalCount));
             }
             return exts;
@@ -379,6 +401,11 @@ public class Querier {
             if (ref instanceof TopHitsAggRef) {
                 TopHitsAggRef r = (TopHitsAggRef) ref;
                 return new TopHitsAggExtractor(r.name(), r.fieldDataType(), cfg.zoneId());
+            }
+
+            if (ref instanceof PivotColumnRef) {
+                PivotColumnRef r = (PivotColumnRef) ref;
+                return new PivotExtractor(createExtractor(r.pivot(), totalCount), createExtractor(r.agg(), totalCount), r.value());
             }
 
             if (ref == GlobalCountRef.INSTANCE) {
@@ -420,10 +447,10 @@ public class Querier {
         @Override
         protected void handleResponse(SearchResponse response, ActionListener<Page> listener) {
             // create response extractors for the first time
-            List<Tuple<FieldExtraction, ExpressionId>> refs = query.fields();
+            List<Tuple<FieldExtraction, String>> refs = query.fields();
 
             List<HitExtractor> exts = new ArrayList<>(refs.size());
-            for (Tuple<FieldExtraction, ExpressionId> ref : refs) {
+            for (Tuple<FieldExtraction, String> ref : refs) {
                 exts.add(createExtractor(ref.v1()));
             }
 

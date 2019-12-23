@@ -77,12 +77,12 @@ public class ConnectionManagerTests extends ESTestCase {
         AtomicInteger nodeDisconnectedCount = new AtomicInteger();
         connectionManager.addListener(new TransportConnectionListener() {
             @Override
-            public void onNodeConnected(DiscoveryNode node) {
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeConnectedCount.incrementAndGet();
             }
 
             @Override
-            public void onNodeDisconnected(DiscoveryNode node) {
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeDisconnectedCount.incrementAndGet();
             }
         });
@@ -124,6 +124,7 @@ public class ConnectionManagerTests extends ESTestCase {
         assertEquals(1, nodeDisconnectedCount.get());
     }
 
+    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/49903")
     public void testConcurrentConnectsAndDisconnects() throws BrokenBarrierException, InterruptedException {
         DiscoveryNode node = new DiscoveryNode("", new TransportAddress(InetAddress.getLoopbackAddress(), 0), Version.CURRENT);
         Transport.Connection connection = new TestConnect(node);
@@ -151,10 +152,11 @@ public class ConnectionManagerTests extends ESTestCase {
             }
         };
 
-        CyclicBarrier barrier = new CyclicBarrier(11);
         List<Thread> threads = new ArrayList<>();
         AtomicInteger nodeConnectedCount = new AtomicInteger();
         AtomicInteger nodeFailureCount = new AtomicInteger();
+
+        CyclicBarrier barrier = new CyclicBarrier(11);
         for (int i = 0; i < 10; i++) {
             Thread thread = new Thread(() -> {
                 try {
@@ -166,6 +168,9 @@ public class ConnectionManagerTests extends ESTestCase {
                 connectionManager.connectToNode(node, connectionProfile, validator,
                     ActionListener.wrap(c -> {
                         nodeConnectedCount.incrementAndGet();
+                        if (connectionManager.nodeConnected(node) == false) {
+                            throw new AssertionError("Expected node to be connected");
+                        }
                         assert latch.getCount() == 1;
                         latch.countDown();
                     }, e -> {
@@ -200,12 +205,12 @@ public class ConnectionManagerTests extends ESTestCase {
         AtomicInteger nodeDisconnectedCount = new AtomicInteger();
         connectionManager.addListener(new TransportConnectionListener() {
             @Override
-            public void onNodeConnected(DiscoveryNode node) {
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeConnectedCount.incrementAndGet();
             }
 
             @Override
-            public void onNodeDisconnected(DiscoveryNode node) {
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeDisconnectedCount.incrementAndGet();
             }
         });
@@ -240,12 +245,12 @@ public class ConnectionManagerTests extends ESTestCase {
         AtomicInteger nodeDisconnectedCount = new AtomicInteger();
         connectionManager.addListener(new TransportConnectionListener() {
             @Override
-            public void onNodeConnected(DiscoveryNode node) {
+            public void onNodeConnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeConnectedCount.incrementAndGet();
             }
 
             @Override
-            public void onNodeDisconnected(DiscoveryNode node) {
+            public void onNodeDisconnected(DiscoveryNode node, Transport.Connection connection) {
                 nodeDisconnectedCount.incrementAndGet();
             }
         });
@@ -289,7 +294,6 @@ public class ConnectionManagerTests extends ESTestCase {
         @Override
         public void sendRequest(long requestId, String action, TransportRequest request, TransportRequestOptions options)
             throws TransportException {
-
         }
     }
 }

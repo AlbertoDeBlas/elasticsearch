@@ -57,6 +57,7 @@ import org.elasticsearch.plugins.NetworkPlugin;
 import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestHandler;
+import org.elasticsearch.rest.RestHeaderDefinition;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.threadpool.ExecutorBuilder;
 import org.elasticsearch.threadpool.FixedExecutorBuilder;
@@ -263,6 +264,7 @@ import java.util.stream.Collectors;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 import static org.elasticsearch.cluster.metadata.IndexMetaData.INDEX_FORMAT_SETTING;
+import static org.elasticsearch.license.XPackLicenseState.FIPS_ALLOWED_LICENSE_OPERATION_MODES;
 import static org.elasticsearch.xpack.core.XPackSettings.API_KEY_SERVICE_ENABLED_SETTING;
 import static org.elasticsearch.xpack.core.XPackSettings.HTTP_SSL_ENABLED;
 import static org.elasticsearch.xpack.core.security.index.RestrictedIndicesNames.SECURITY_MAIN_ALIAS;
@@ -291,7 +293,7 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
     private final SetOnce<SecurityIndexManager> securityIndex = new SetOnce<>();
     private final SetOnce<NioGroupFactory> groupFactory = new SetOnce<>();
     private final SetOnce<DocumentSubsetBitsetCache> dlsBitsetCache = new SetOnce<>();
-    private final List<BootstrapCheck> bootstrapChecks;
+    private final SetOnce<List<BootstrapCheck>> bootstrapChecks = new SetOnce<>();
     private final List<SecurityExtension> securityExtensions = new ArrayList<>();
 
     public Security(Settings settings, final Path configPath) {
@@ -299,28 +301,19 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
     }
 
     Security(Settings settings, final Path configPath, List<SecurityExtension> extensions) {
+        // TODO This is wrong. Settings can change after this. We should use the settings from createComponents
         this.settings = settings;
+        // TODO this is wrong, we should only use the environment that is provided to createComponents
         this.env = new Environment(settings, configPath);
         this.enabled = XPackSettings.SECURITY_ENABLED.get(settings);
         if (enabled) {
             runStartupChecks(settings);
             // we load them all here otherwise we can't access secure settings since they are closed once the checks are
             // fetched
-            final List<BootstrapCheck> checks = new ArrayList<>();
-            checks.addAll(Arrays.asList(
-                new ApiKeySSLBootstrapCheck(),
-                new TokenSSLBootstrapCheck(),
-                new PkiRealmBootstrapCheck(getSslService()),
-                new TLSLicenseBootstrapCheck(),
-                new FIPS140SecureSettingsBootstrapCheck(settings, env),
-                new FIPS140JKSKeystoreBootstrapCheck(),
-                new FIPS140PasswordHashingAlgorithmBootstrapCheck(),
-                new FIPS140LicenseBootstrapCheck()));
-            checks.addAll(InternalRealms.getBootstrapChecks(settings, env));
-            this.bootstrapChecks = Collections.unmodifiableList(checks);
+
             Automatons.updateConfiguration(settings);
         } else {
-            this.bootstrapChecks = Collections.emptyList();
+            this.bootstrapChecks.set(Collections.emptyList());
         }
         this.securityExtensions.addAll(extensions);
 
@@ -328,6 +321,9 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
 
     private static void runStartupChecks(Settings settings) {
         validateRealmSettings(settings);
+        if (XPackSettings.FIPS_MODE_ENABLED.get(settings)) {
+            validateForFips(settings);
+        }
     }
 
     // overridable by tests
@@ -343,7 +339,7 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
                                                NamedXContentRegistry xContentRegistry, Environment environment,
                                                NodeEnvironment nodeEnvironment, NamedWriteableRegistry namedWriteableRegistry) {
         try {
-            return createComponents(client, threadPool, clusterService, resourceWatcherService, scriptService);
+            return createComponents(client, threadPool, clusterService, resourceWatcherService, scriptService, xContentRegistry);
         } catch (final Exception e) {
             throw new IllegalStateException("security initialization failed", e);
         }
@@ -351,19 +347,27 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
 
     // pkg private for testing - tests want to pass in their set of extensions hence we are not using the extension service directly
     Collection<Object> createComponents(Client client, ThreadPool threadPool, ClusterService clusterService,
-                                        ResourceWatcherService resourceWatcherService, ScriptService scriptService) throws Exception {
+                                        ResourceWatcherService resourceWatcherService, ScriptService scriptService,
+                                        NamedXContentRegistry xContentRegistry) throws Exception {
         if (enabled == false) {
             return Collections.singletonList(new SecurityUsageServices(null, null, null, null));
         }
+
+        // We need to construct the checks here while the secure settings are still available.
+        // If we wait until #getBoostrapChecks the secure settings will have been cleared/closed.
+        final List<BootstrapCheck> checks = new ArrayList<>();
+        checks.addAll(Arrays.asList(
+            new ApiKeySSLBootstrapCheck(),
+            new TokenSSLBootstrapCheck(),
+            new PkiRealmBootstrapCheck(getSslService()),
+            new TLSLicenseBootstrapCheck()));
+        checks.addAll(InternalRealms.getBootstrapChecks(settings, env));
+        this.bootstrapChecks.set(Collections.unmodifiableList(checks));
 
         threadContext.set(threadPool.getThreadContext());
         List<Object> components = new ArrayList<>();
         securityContext.set(new SecurityContext(settings, threadPool.getThreadContext()));
         components.add(securityContext.get());
-
-        if (XPackSettings.DLS_FLS_ENABLED.get(settings)) {
-            dlsBitsetCache.set(new DocumentSubsetBitsetCache(settings));
-        }
 
         // audit trail service construction
         final List<AuditTrail> auditTrails = XPackSettings.AUDIT_ENABLED.get(settings)
@@ -408,8 +412,10 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
         final NativePrivilegeStore privilegeStore = new NativePrivilegeStore(settings, client, securityIndex.get());
         components.add(privilegeStore);
 
+        dlsBitsetCache.set(new DocumentSubsetBitsetCache(settings));
         final FieldPermissionsCache fieldPermissionsCache = new FieldPermissionsCache(settings);
-        final FileRolesStore fileRolesStore = new FileRolesStore(settings, env, resourceWatcherService, getLicenseState());
+        final FileRolesStore fileRolesStore = new FileRolesStore(settings, env, resourceWatcherService, getLicenseState(),
+            xContentRegistry);
         final NativeRolesStore nativeRolesStore = new NativeRolesStore(settings, client, getLicenseState(), securityIndex.get());
         final ReservedRolesStore reservedRolesStore = new ReservedRolesStore();
         List<BiConsumer<Set<String>, ActionListener<RoleRetrievalResult>>> rolesProviders = new ArrayList<>();
@@ -588,6 +594,7 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
         // The following just apply in node mode
         settingsList.add(XPackSettings.FIPS_MODE_ENABLED);
 
+        SSLService.registerSettings(settingsList);
         // IP Filter settings
         IPFilter.addSettings(settingsList);
 
@@ -622,14 +629,14 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
     }
 
     @Override
-    public Collection<String> getRestHeaders() {
-        Set<String> headers = new HashSet<>();
-        headers.add(UsernamePasswordToken.BASIC_AUTH_HEADER);
+    public Collection<RestHeaderDefinition> getRestHeaders() {
+        Set<RestHeaderDefinition> headers = new HashSet<>();
+        headers.add(new RestHeaderDefinition(UsernamePasswordToken.BASIC_AUTH_HEADER, false));
         if (XPackSettings.AUDIT_ENABLED.get(settings)) {
-            headers.add(AuditTrail.X_FORWARDED_FOR_HEADER);
+            headers.add(new RestHeaderDefinition(AuditTrail.X_FORWARDED_FOR_HEADER, true));
         }
         if (AuthenticationServiceField.RUN_AS_ENABLED.get(settings)) {
-            headers.add(AuthenticationServiceField.RUN_AS_USER_HEADER);
+            headers.add(new RestHeaderDefinition(AuthenticationServiceField.RUN_AS_USER_HEADER, false));
         }
         return headers;
     }
@@ -645,7 +652,7 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
 
     @Override
     public List<BootstrapCheck> getBootstrapChecks() {
-       return bootstrapChecks;
+       return bootstrapChecks.get();
     }
 
     @Override
@@ -831,6 +838,37 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
         }
     }
 
+    static void validateForFips(Settings settings) {
+        final List<String> validationErrors = new ArrayList<>();
+        Settings keystoreTypeSettings = settings.filter(k -> k.endsWith("keystore.type"))
+            .filter(k -> settings.get(k).equalsIgnoreCase("jks"));
+        if (keystoreTypeSettings.isEmpty() == false) {
+            validationErrors.add("JKS Keystores cannot be used in a FIPS 140 compliant JVM. Please " +
+                "revisit [" + keystoreTypeSettings.toDelimitedString(',') + "] settings");
+        }
+        Settings keystorePathSettings = settings.filter(k -> k.endsWith("keystore.path"))
+            .filter(k -> settings.hasValue(k.replace(".path", ".type")) == false);
+        if (keystorePathSettings.isEmpty() == false && SSLConfigurationSettings.inferKeyStoreType(null).equals("jks")) {
+            validationErrors.add("JKS Keystores cannot be used in a FIPS 140 compliant JVM. Please " +
+                "revisit [" + keystorePathSettings.toDelimitedString(',') + "] settings");
+        }
+        final String selectedAlgorithm = XPackSettings.PASSWORD_HASHING_ALGORITHM.get(settings);
+        if (selectedAlgorithm.toLowerCase(Locale.ROOT).startsWith("pbkdf2") == false) {
+            validationErrors.add("Only PBKDF2 is allowed for password hashing in a FIPS 140 JVM. Please set the " +
+                "appropriate value for [ " + XPackSettings.PASSWORD_HASHING_ALGORITHM.getKey() + " ] setting.");
+        }
+
+        if (validationErrors.isEmpty() == false) {
+            final StringBuilder sb = new StringBuilder();
+            sb.append("Validation for FIPS 140 mode failed: \n");
+            int index = 0;
+            for (String error : validationErrors) {
+                sb.append(++index).append(": ").append(error).append(";\n");
+            }
+            throw new IllegalArgumentException(sb.toString());
+        }
+    }
+
     @Override
     public List<TransportInterceptor> getTransportInterceptors(NamedWriteableRegistry namedWriteableRegistry, ThreadContext threadContext) {
         if (enabled == false) { // don't register anything if we are not enabled
@@ -999,7 +1037,7 @@ public class Security extends Plugin implements ActionPlugin, IngestPlugin, Netw
             if (inFipsMode) {
                 License license = LicenseService.getLicense(state.metaData());
                 if (license != null &&
-                    FIPS140LicenseBootstrapCheck.ALLOWED_LICENSE_OPERATION_MODES.contains(license.operationMode()) == false) {
+                    FIPS_ALLOWED_LICENSE_OPERATION_MODES.contains(license.operationMode()) == false) {
                     throw new IllegalStateException("FIPS mode cannot be used with a [" + license.operationMode() +
                         "] license. It is only allowed with a Platinum or Trial license.");
 
